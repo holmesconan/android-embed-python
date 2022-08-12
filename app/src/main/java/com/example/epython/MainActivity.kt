@@ -8,4 +8,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
     }
+
+    external fun startPythonThread(apkDir: String, filesDir: String, externalFilesDir: String): Int
+
+    companion object {
+        init {
+            System.loadLibrary("python")
+        }
+    }
 }
