@@ -1,0 +1,40 @@
+#!/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import zipfile
+from pathlib import Path
+
+
+def main(args):
+    abi_list = os.listdir(args.root_dir)
+    if os.path.exists(args.output):
+        os.unlink(args.output)
+
+    with zipfile.PyZipFile(args.output, mode="w") as zip_mod:
+        src_dir = os.path.join(args.root_dir, abi_list[0], 'lib', 'python3.10')
+        for name in os.listdir(src_dir):
+            if name in {"pydoc_data", "lib-dynload", "test", "idlelib", "lib2to3"}:
+                continue
+
+            if '__pycache__' in name:
+                continue
+
+            full_path = os.path.join(src_dir, name)
+
+            if os.path.isfile(full_path) and not name.endswith(".py"):
+                continue
+
+            zip_mod.writepy(full_path)
+
+        for abi in abi_list[1:]:
+            src_dir = os.path.join(args.root_dir, abi, 'lib', 'python3.10')
+            for name in os.listdir(src_dir):
+                if 'sysconfigdata' in name:
+                    full_path = os.path.join(src_dir, name)
+                    zip_mod.writepy(full_path)
+
+
+if __name__ == "__main__":
+    root = Path(__file__).parents[1]
+    print(root)
+

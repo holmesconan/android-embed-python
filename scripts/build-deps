@@ -1,0 +1,489 @@
+#!/bin/bash
+SCRIPT_DIR=$( cd -- $( dirname -- ${BASH_SOURCE[0]} ) &> /dev/null && pwd )
+ROOT_DIR=$(realpath $SCRIPT_DIR/..)
+INSTALL_BASE_DIR=$ROOT_DIR/deps
+TMP=/tmp
+
+# define global variables
+ANDROID_SDK_ROOT=$HOME/.android/Sdk
+#ANDROID_SDK_ROOT=/d/home/.android/Sdk
+#ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/25.0.8775105
+ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/25.1.8937393
+CMAKE_PATH=$ANDROID_SDK_ROOT/cmake/3.24.2
+BUILD_PYTHON=$HOME/.pyenv/shims/python3.10
+# Build PATH on Linux
+BUILD_PATH=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin
+BUILD_PATH=$BUILD_PATH:$CMAKE_PATH/bin
+BUILD_PATH=$BUILD_PATH:$(dirname $BUILD_PYTHON)
+BUILD_PATH=$BUILD_PATH:/usr/bin:/bin
+# Build PATH on MSYS
+#BUILD_PATH=$ANDROID_SDK_ROOT/cmake/3.23.2/bin:$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/windows-x86_64/bin:/clang64/bin:/usr/local/bin:/usr/bin/core_perl:/usr/bin:/bin
+
+ANDROID_NATIVE_API_LEVEL=28
+TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake 
+CMAKE_OPTS=( "-DANDROID_STL=c++_shared" "-DANDROID_NATIVE_API_LEVEL=$ANDROID_NATIVE_API_LEVEL" "-DANDROID_PLATFORM=android-$ANDROID_NATIVE_API_LEVEL" "-DANDROID_USE_LEGACY_TOOLCHAIN_FILE=OFF" "-DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE" "-DCMAKE_BUILD_TYPE=Release" )
+LLVM_TOOLCHAIN=( "AR=llvm-ar" "AS=llvm-as" "LD=ld.lld" "NM=llvm-nm" "RANLIB=llvm-ranlib" "READELF=llvm-readelf" "STRIP=llvm-strip" "OBJDUMP=llvm-objdump" )
+ 
+declare -A abi_cc
+declare -A abi_host
+declare -A abi_openssl_target
+declare -A downloaded_check
+
+abi_cc["x86"]="i686-linux-android$ANDROID_NATIVE_API_LEVEL-clang"
+abi_cc["x86_64"]="x86_64-linux-android$ANDROID_NATIVE_API_LEVEL-clang"
+abi_cc["armeabi-v7a"]="armv7a-linux-androideabi$ANDROID_NATIVE_API_LEVEL-clang"
+abi_cc["arm64-v8a"]="aarch64-linux-android$ANDROID_NATIVE_API_LEVEL-clang"
+
+abi_host["x86"]="i686-unknown-linux-android"
+abi_host["x86_64"]="x86_64-unknown-linux-android"
+abi_host["armeabi-v7a"]="armv7a-unknown-linux-android"
+abi_host["arm64-v8a"]="aarch64-unknown-linux-android"
+
+abi_openssl_target["x86"]="android-x86"
+abi_openssl_target["x86_64"]="android-x86_64"
+abi_openssl_target["armeabi-v7a"]="android-arm"
+abi_openssl_target["arm64-v8a"]="android-arm64"
+
+# define utility functions
+function check_prog {
+  printf "checking for %s... " $1
+  if ! command -v $1; then
+    echo no
+    exit 1
+  fi
+}
+
+function download_from_url {
+  local file=$ROOT_DIR/downloads/$1
+  local url=$2
+  local checksum=$3
+
+  if [ -e $file ]; then
+    echo "$checksum  $file" | shasum -a 256 -c --quiet
+    if [ $? = 0 ]; then
+      if [ "${downloaded_check[$1]}" == "" ]; then
+        echo using $(realpath --relative-to=$ROOT_DIR $file)
+        downloaded_check["$1"]="check"
+      fi
+      return
+    else
+      rm -v $file
+    fi
+  fi
+
+  mkdir -p $ROOT_DIR/downloads
+  wget -O $file $url
+
+  echo "$checksum  $file" | shasum -a 256 -c --quiet
+  if [ $? -ne 0 ]; then exit 1; fi
+}
+
+function download_from_github {
+  local file=$3
+  local checksum=$4
+  local url=https://github.com/$1/archive/refs/tags/$2
+
+  download_from_url $file $url $checksum
+}
+
+function download_from_sourceforge {
+  local project=$1
+  local file=$2
+  local checksum=$3
+  local url=https://sourceforge.net/projects/$project/files/$2
+
+  download_from_url $file $url $checksum
+}
+
+function extract_src {
+  local name=$1
+  local dir=$ROOT_DIR/tmp/$name
+
+  mkdir -p $dir
+  if [ ! -e $dir/src ]; then
+    rm -rf $dir && mkdir -p $dir
+    tar -C $dir -xzf $ROOT_DIR/downloads/$name.tar.gz
+
+    for d in $(ls $dir)
+    do
+      mv $dir/$d $dir/src
+    done
+  fi
+}
+
+function make_and_install {
+  local n_jobs=4
+  local build_dir=$1
+
+  printf " ... make"
+  env -C $build_dir -i PATH=$BUILD_PATH TMP=$TMP make -j$n_jobs 1>$build_dir/make.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+
+  printf " ... install"
+  env -C $build_dir -i PATH=$BUILD_PATH make install 1>$build_dir/install.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+  echo " ... done."
+}
+
+function build_with_configure_make {
+  local name=$1
+  local abi=$2
+  local cc=${abi_cc[$abi]}
+  local src_dir=$ROOT_DIR/tmp/$name/src
+  local build_dir=$ROOT_DIR/tmp/$name/$abi
+  local install_dir=$INSTALL_BASE_DIR/$abi
+  local args=()
+
+  if [[ $name == msgpack* ]]; then
+      src_dir=$src_dir/cpp
+  fi
+
+  # remove name and abi
+  shift 2
+
+  if [ "$1" == "--" ]; then
+      shift 1
+  else
+      args+=("--prefix=$install_dir")
+      args+=("--host=${abi_host[$abi]}")
+      args+=("--enable-silent-rules")
+  fi
+
+  rm -rf $build_dir && mkdir -p $build_dir
+  printf "$name on $abi configure"
+  env -C $build_dir -i PATH=$BUILD_PATH TMP=$TMP \
+    CC=$cc CXX=${cc}++ \
+    ${LLVM_TOOLCHAIN[@]} \
+    LDFLAGS="-lc++_shared" \
+    $(realpath --relative-to=$build_dir $src_dir)/configure \
+      ${args[@]} $* \
+      1>$build_dir/configure.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+
+  make_and_install $build_dir
+}
+
+function cmake_build_and_install {
+  local abi=$1
+  local build_dir=$2
+  local install_dir=$3
+
+  printf " ... build"
+  env -C $build_dir -i PATH=$BUILD_PATH cmake --build . --config Release 1>$build_dir/cmake-build.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+
+  printf " ... install"
+  env -C $build_dir -i PATH=$BUILD_PATH cmake --install . --prefix $install_dir 1>$build_dir/cmake-install.log 2>&1
+  if [ $? -ne 0 ]; then exit $?; fi
+  echo " ... done."
+}
+
+function build_with_cmake {
+  local name=$1
+  local abi=$2
+  local src_dir=$ROOT_DIR/tmp/$name/src
+  local build_dir=$ROOT_DIR/tmp/$name/$abi
+  local install_dir=$INSTALL_BASE_DIR/$abi
+
+  if [[ $name == expat* ]]; then
+      src_dir=$src_dir/expat
+  fi
+
+  # rmeove name and abi
+  shift 2
+
+  rm -rf $build_dir && mkdir -p $build_dir
+  printf "$name on $abi config"
+  env -C $build_dir -i PATH=$BUILD_PATH PROCESSOR_ARCHITECTURE=AMD64 \
+    cmake -GNinja -DANDROID_ABI=$abi ${CMAKE_OPTS[@]} $* \
+      -DCMAKE_FIND_ROOT_PATH=$install_dir \
+      $(realpath --relative-to=$build_dir $src_dir) \
+      1>$build_dir/cmake-config.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+
+  cmake_build_and_install $abi $build_dir $install_dir
+}
+
+function build_bzip2 {
+  local abi=$1
+  local version=1.0.8
+  local name=bzip2-$version
+  local checksum="ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269"
+  local src_dir=$ROOT_DIR/tmp/$name/src
+  local installed_check=$INSTALL_BASE_DIR/$abi/lib/libbz2.a
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_url $name.tar.gz https://sourceware.org/pub/bzip2/$name.tar.gz $checksum
+  extract_src $name
+
+  if [ ! -e $src_dir/CMakeLists.txt ]; then
+    cp $SCRIPT_DIR/bzip2/CMakeLists.txt $src_dir
+  fi
+
+  build_with_cmake $name $abi \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DBZIP2_SKIP_TOOLS=ON
+}
+
+function build_expat {
+  local abi=$1
+  local version=2.4.8
+  local name=expat-$version
+  local checksum="122d8ae7a0170b9835cb45b216d856c1f83dd83792f8f0f80c31e98283efbe87"
+  local installed_check=$INSTALL_BASE_DIR/$abi/lib/libexpat.a
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_github libexpat/libexpat R_2_4_8.tar.gz $name.tar.gz $checksum
+  extract_src $name
+
+  build_with_cmake $name $abi \
+    -DEXPAT_BUILD_EXAMPLES=OFF \
+    -DEXPAT_BUILD_TESTS=OFF \
+    -DEXPAT_BUILD_TOOLS=OFF \
+    -DEXPAT_LARGE_SIZE=ON \
+    -DEXPAT_MIN_SIZE=ON \
+    -DEXPAT_SHARED_LIBS=OFF
+}
+
+function build_libffi {
+  local abi=$1
+  local version=3.4.2
+  local name=libffi-$version
+  local checksum="0acbca9fd9c0eeed7e5d9460ae2ea945d3f1f3d48e13a4c54da12c7e0d23c313"
+  local src_dir=$ROOT_DIR/tmp/$name/src
+  local installed_check=$INSTALL_BASE_DIR/$abi/lib/libffi.a
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_github libffi/libffi v$version.tar.gz $name.tar.gz $checksum
+  extract_src $name
+
+  if [ ! -e $src_dir/configure ]; then
+    printf "$name generate configure script... "
+    env -C $src_dir \
+      bash -c "./autogen.sh 1>$src_dir/autogen-out.log 2>$src_dir/autogen-err.log"
+    if [ $? == 0 ]; then
+      echo "ok"
+    else
+      echo "failed"
+      exit 1
+    fi
+  fi
+
+  build_with_configure_make $name $abi \
+    --enable-shared=no \
+    --enable-static=yes \
+    --disable-docs
+}
+
+function build_liblzma {
+  local abi=$1
+  local version=5.2.5
+  local name=liblzma-$version
+  local checksum="0d2b89629f13dd1a0602810529327195eff5f62a0142ccd65b903bc16a4ac78a"
+  local installed_check=$INSTALL_BASE_DIR/$abi/lib/liblzma.a
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_github xz-mirror/xz v$version.tar.gz $name.tar.gz $checksum
+  extract_src $name
+  build_with_cmake $name $abi \
+    -DBUILD_SHARED_LIBS=OFF
+}
+
+function build_libuuid {
+  local abi=$1
+  local version=1.0.3
+  local name=libuuid-$version
+  local checksum="46af3275291091009ad7f1b899de3d0cea0252737550e7919d17237997db5644"
+  local installed_check=$INSTALL_BASE_DIR/$abi/lib/libuuid.a
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_sourceforge libuuid $name.tar.gz $checksum
+  extract_src $name
+
+  build_with_configure_make $name $abi \
+    --enable-shared=no \
+    --enable-static=yes \
+    --with-pic
+}
+
+function build_zlib {
+  local abi=$1
+  local cc=${abi_cc[$abi]}
+  local version=1.2.12
+  local name=zlib-$version
+  local checksum="d8688496ea40fb61787500e863cc63c9afcbc524468cedeb478068924eb54932"
+  local installed_check=$INSTALL_BASE_DIR/$abi/lib/libz.a
+  local src_dir=$ROOT_DIR/tmp/$name/src
+  local build_dir=$ROOT_DIR/tmp/$name/$abi
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_github madler/zlib v$version.tar.gz $name.tar.gz $checksum
+  extract_src $name
+
+  rm -rf $build_dir && mkdir -p $build_dir
+  printf "$name on $abi configure"
+  env -C $build_dir -i PATH=$BUILD_PATH TMP=$TMP \
+    CC=$cc CXX=${cc}++ \
+    ${LLVM_TOOLCHAIN[@]} \
+    $(realpath --relative-to=$build_dir $src_dir)/configure \
+      --static --prefix=$INSTALL_BASE_DIR/$abi \
+      1>$build_dir/configure.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+
+  # fix CFLAGS
+  sed -i "s/^CFLAGS=\(.*\)$/\#CFLAGS=\1/" $build_dir/Makefile
+  sed -i "s/^\#CFLAGS=-O3\(.*\)[\]$/CFLAGS=-O3\1 -fPIC \\\\/" $build_dir/Makefile
+  sed -i "s/^\#\(\s*\)-Wstrict-\(.*\)$/\1-Wstrict-\2/" $build_dir/Makefile
+  if [ $? -ne 0 ]; then exit 1; fi
+ 
+  make_and_install $build_dir
+}
+
+function build_sqlite3 {
+  local abi=$1
+  local version=3.39.2
+  local name=sqlite3-$version
+  local checksum="852be8a6183a17ba47cee0bbff7400b7aa5affd283bf3beefc34fcd088a239de"
+  local installed_check=$INSTALL_BASE_DIR/$abi/lib/libsqlite3.so
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_url $name.tar.gz https://www.sqlite.org/2022/sqlite-autoconf-3390200.tar.gz $checksum
+  extract_src $name
+  build_with_configure_make $name $abi \
+    --enable-shared=yes \
+    --enable-static=no \
+    --disable-static-shell \
+    --disable-editline \
+    --disable-readline
+}
+
+function build_openssl {
+  local abi=$1
+  local version=3.0.5
+  local name=openssl-$version
+  local checksum="b6363cf1bca88f0a46a768883a225e644135432d6a51ab1c4660ab58af541078"
+  local src_dir=$ROOT_DIR/tmp/$name/src
+  local build_dir=$ROOT_DIR/tmp/$name/$abi
+  local install_dir=$INSTALL_BASE_DIR/$abi
+  local installed_check=$install_dir/lib/libssl.a
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_github openssl/openssl $name.tar.gz $name.tar.gz $checksum
+  extract_src $name
+
+  rm -rf $build_dir && mkdir -p $build_dir
+  printf "$name on $abi configure"
+  env -C $build_dir -i PATH=$BUILD_PATH TMP=$TMP \
+    ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT \
+    perl $(realpath --relative-to=$build_dir $src_dir)/Configure \
+      --prefix=$install_dir \
+      --openssldir=$install_dir \
+      ${abi_openssl_target[$abi]} \
+      -DLDFLAGS='-lc++_shared' \
+      -D__ANDROID_API__=$ANDROID_NATIVE_API_LEVEL \
+      1>$build_dir/Configure.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+
+  make_and_install $build_dir
+}
+
+function build_python3 {
+  local abi=$1
+  local cc=${abi_cc[$abi]}
+  local version=3.10.5
+  local name=python3-$version
+  local checksum="0d489fb18feb06a581faddcf1cad74a3be77c99aca3a90a17ce204bb594f393a"
+  local src_dir=$ROOT_DIR/tmp/$name/src
+  local build_dir=$ROOT_DIR/tmp/$name/$abi
+  local install_dir=$INSTALL_BASE_DIR/$abi
+  local installed_check=$install_dir/lib/libpython3.10.so
+  local build=x86_64-pc-linux-gnu
+  #local build=x86_64-pc-mingw64
+
+  if [ -e $installed_check ]; then return; fi
+
+  download_from_github python/cpython v$version.tar.gz $name.tar.gz $checksum
+  extract_src $name
+
+  if [ ! -e $src_dir/config.site ]; then
+    cat <<EOF > $src_dir/config.site
+ac_cv_file__dev_ptmx=no
+ac_cv_file__dev_ptc=no
+EOF
+
+    # apply setup.py.patch
+    env -C $src_dir patch setup.py $SCRIPT_DIR/python3/setup.py.patch
+  fi
+
+  rm -rf $build_dir && mkdir -p $build_dir
+  printf "$name on $abi configure"
+  env -C $build_dir -i PATH=$BUILD_PATH TMP=$TMP \
+    CC=$cc CXX=${cc}++ \
+    ${LLVM_TOOLCHAIN[@]} \
+    $(realpath --relative-to=$build_dir $src_dir)/configure \
+      --prefix=$install_dir \
+      --host=${abi_host[$abi]} \
+      --build=$build \
+      --enable-shared \
+      --disable-ipv6 \
+      --disable-test-modules \
+      --with-lto \
+      --with-ensurepip=no \
+      --with-system-expat \
+      --with-tcltk-includes='' \
+      --with-tcltk-libs='' \
+      --with-openssl-rpath=no \
+      --without-readline \
+      --without-static-libpython \
+      CFLAGS="-I$install_dir/include -fPIC" \
+      LDFLAGS="-L$install_dir/lib" \
+      CONFIG_SITE=$src_dir/config.site \
+      1>$build_dir/configure.log 2>&1
+  if [ $? -ne 0 ]; then exit 1; fi
+
+  # change INSTSONAME
+  sed -i "s/^INSTSONAME=\(.*\)\.so\.1\.0/INSTSONAME=\1.so/" $build_dir/Makefile
+
+  make_and_install $build_dir
+}
+
+# checking prerequisites
+check_prog env
+check_prog tar
+check_prog wget
+check_prog make
+check_prog perl
+check_prog patch
+check_prog shasum
+check_prog autoconf
+check_prog automake
+check_prog autoreconf
+check_prog python3.10
+echo ""
+
+mkdir -p $ROOT_DIR/tmp
+for abi in ${!abi_cc[@]}
+do
+  build_bzip2 $abi
+  build_expat $abi
+  build_libffi $abi
+  build_liblzma $abi
+  build_libuuid $abi
+  build_zlib $abi
+  build_sqlite3 $abi
+  build_openssl $abi
+  build_python3 $abi
+done
+
+echo create zip file
+rm -f $ROOT_DIR/deps.zip
+env -C $ROOT_DIR zip -q -r deps.zip deps/{armeabi-v7a,arm64-v8a,x86,x86_64}/{include,lib} -x "*.py" -x "*.pyc"
+

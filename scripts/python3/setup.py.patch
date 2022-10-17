@@ -1,0 +1,14 @@
+756a757,760
+>         cflags = sysconfig.get_config_var("CFLAGS")
+>         for m in re.finditer(r"\s*\-I([^ ]+)\s*", cflags):
+>           add_dir_to_list(self.compiler.include_dirs, m.group(1))
+> 
+772c776
+<                         elif line.startswith("clang version"):
+---
+>                         elif "clang version" in line:
+1554c1558
+<             sqlite_inc_paths = []
+---
+>             sqlite_inc_paths = self.compiler.include_dirs
+
